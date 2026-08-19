@@ -9,6 +9,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import networkx as nx
 from networkx.algorithms.community import modularity as nx_modularity
+from networkx.algorithms.community import louvain_communities
 
 from sklearn.cluster import KMeans
 from sklearn.metrics import (adjusted_rand_score, normalized_mutual_info_score,
@@ -16,7 +17,7 @@ from sklearn.metrics import (adjusted_rand_score, normalized_mutual_info_score,
 from scipy.stats import spearmanr
 
 from build_graph import PROC, build_graph_knn, node_table
-from connection_sheaf import tangent_frames, connection_laplacian
+from connection_sheaf import tangent_frames, connection_laplacian, procrustes
 from node_classify import node_features
 
 TOL = 1e-8
@@ -46,17 +47,22 @@ def stalk_prices(P: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
 
 def stalk_augmented(R: pd.DataFrame, tickers: list[str],
                     volumes: pd.DataFrame | None, vol_win: int = 20,
-                    use_vol=True, use_volume=True) -> pd.DataFrame:
-    """Стебель = [z(доходности) ; z(rolling-волатильность) ; z(log-объём)]."""
-    blocks = [_z(R[tickers].to_numpy(float))]
+                    use_vol=True, use_volume=True,
+                    w_returns: float = 1.0, w_vol: float = 0.5,
+                    w_volume: float = 0.5) -> pd.DataFrame:
+    """Стебель = взвешенная конкатенация [доходности ; волатильность ; объём]."""
+    def _wblock(mat: np.ndarray, weight: float) -> np.ndarray:
+        z = _z(mat)
+        return z / np.sqrt(z.shape[0]) * float(weight)  # равный вклад по размерности
+    blocks = [_wblock(R[tickers].to_numpy(float), w_returns)]
     if use_vol:
         rv = R[tickers].rolling(vol_win, min_periods=5).std().bfill().to_numpy(float)
-        blocks.append(_z(rv))
+        blocks.append(_wblock(rv, w_vol))
     if use_volume and volumes is not None:
         v = volumes.reindex(R.index).reindex(columns=tickers).ffill().bfill()
         # если у части тикеров объёмы недоступны — подставляем медиану по строке
         v = v.apply(lambda row: row.fillna(row.median()), axis=1)
-        blocks.append(_z(np.log(v.to_numpy(float) + 1.0)))
+        blocks.append(_wblock(np.log(v.to_numpy(float) + 1.0), w_volume))
     X = np.vstack(blocks)                             # (F, n), F = сумма длин блоков
     return pd.DataFrame(X, columns=tickers)
 
@@ -101,6 +107,47 @@ def load_volumes(tickers: list[str], index: pd.DatetimeIndex) -> pd.DataFrame | 
 
 
 
+#  Корреляционная матрица рынка (Эксперимент А: робастная альтернатива Пирсону)
+def market_corr(Rw: pd.DataFrame, method: str = "pearson") -> pd.DataFrame:
+    if method == "spearman":
+        return Rw.corr(method="spearman")
+    if method == "robust":
+        lo = Rw.quantile(0.025)
+        hi = Rw.quantile(0.975)
+        Rc = Rw.clip(lower=lo, upper=hi, axis=1)
+        return Rc.corr(method="pearson")
+    return Rw.corr(method="pearson")
+
+
+
+#  Эксперимент В: матричные стебли на многообразии SPD (Peng et al.)
+def regional_returns(R: pd.DataFrame, tickers: list[str], meta) -> pd.DataFrame:
+    "
+    out = {}
+    for cty in sorted({meta.loc[t, "country"] for t in tickers}):
+        cols = [t for t in tickers if meta.loc[t, "country"] == cty]
+        out[f"mkt_{cty}"] = R[cols].mean(axis=1)
+    return pd.DataFrame(out, index=R.index)
+
+
+def spd_logeuclid_embed(R: pd.DataFrame, tickers: list[str], meta,
+                        reg: float = 1e-2) -> np.ndarray:
+    reg_ret = regional_returns(R, tickers, meta).to_numpy(float)     # (T, C)
+    p = reg_ret.shape[1] + 1
+    iu = np.triu_indices(p)
+    sqrt2 = np.where(iu[0] == iu[1], 1.0, np.sqrt(2.0))              # метрика Фробениуса
+    descs = []
+    for t in tickers:
+        M = np.column_stack([R[t].to_numpy(float), reg_ret])        # (T, p)
+        C = np.cov(M, rowvar=False)
+        C = C + reg * (np.trace(C) / p) * np.eye(p)                 # SPD-регуляризация
+        w, V = np.linalg.eigh(C)
+        logC = (V * np.log(np.clip(w, 1e-12, None))) @ V.T
+        descs.append(logC[iu] * sqrt2)
+    return _z(np.array(descs))                                      # (n, p(p+1)/2)
+
+
+
 #  Спектральные вложения: пучок vs граф
 def sheaf_embed(L: np.ndarray, deg: np.ndarray, n: int, d: int, m: int):
     """Нормированный connection Laplacian D^{-1/2} L D^{-1/2}; m младших собств.
@@ -132,6 +179,38 @@ def kmeans_labels(emb: np.ndarray, k: int) -> np.ndarray:
     return KMeans(n_clusters=k, n_init=10, random_state=RNG).fit_predict(emb)
 
 
+def transport_agreement(Oij: np.ndarray, d: int) -> float:
+    return float(max(0.0, 1.0 - np.linalg.norm(Oij - np.eye(d), "fro") / (2.0 * np.sqrt(d))))
+
+
+def louvain_sheaf(G, frames: dict, tickers: list[str], d: int,
+                  resolution: float = 1.0) -> np.ndarray:
+    W = nx.Graph()
+    W.add_nodes_from(tickers)
+    for a, b, data in G.edges(data=True):
+        w = float(data["weight"])
+        agree = transport_agreement(procrustes(frames[a], frames[b]), d)
+        we = w * agree
+        if we > 1e-9:
+            W.add_edge(a, b, weight=we)
+    comms = louvain_communities(W, weight="weight", resolution=resolution, seed=RNG)
+    lab = {}
+    for c, nodes in enumerate(comms):
+        for t in nodes:
+            lab[t] = c
+    return np.array([lab.get(t, -1) for t in tickers])
+
+
+def adaptive_k(k_base: int, n_days: int, vol_annual: float, n_assets: int,
+               vol_ref: float = 0.20) -> int:
+    """Адаптивное число соседей kNN для локального PCA."""
+    vol_factor = float(np.clip(vol_annual / vol_ref, 1.0, 2.5))
+    k = int(round(k_base * vol_factor))
+    k_cap_days = max(k_base, int(np.sqrt(max(n_days, 1))))
+    k = min(k, k_cap_days, n_assets - 1)
+    return max(3, k)
+
+
 def adjacency(G, tickers):
     idx = {t: i for i, t in enumerate(tickers)}
     A = np.zeros((len(tickers), len(tickers)))
@@ -161,11 +240,16 @@ def eval_partition(pred, emb, y_sec, y_cty, G, tickers):
 
 def run_both(feat: pd.DataFrame, R_win: pd.DataFrame, tickers, meta,
              sim: pd.DataFrame, d: int, k_graph: int, n_clusters: int,
-             m_sheaf: int):
+             m_sheaf: int, adaptive: bool = True):
     """Строит kNN-граф по корреляциям, затем пучковую и графовую кластеризацию."""
-    G = build_graph_knn(sim.loc[tickers, tickers], meta, k=k_graph,
-                        signed=True, mutual=False)
     n = len(tickers)
+    if adaptive:
+        vol_annual = float(R_win.mean(axis=1).std() * np.sqrt(252))
+        k_eff = adaptive_k(k_graph, len(R_win), vol_annual, n)
+    else:
+        k_eff = k_graph
+    G = build_graph_knn(sim.loc[tickers, tickers], meta, k=k_eff,
+                        signed=True, mutual=False)
     y_sec = np.array([meta.loc[t, "sector"] for t in tickers])
     y_cty = np.array([meta.loc[t, "country"] for t in tickers])
 
@@ -175,6 +259,10 @@ def run_both(feat: pd.DataFrame, R_win: pd.DataFrame, tickers, meta,
     emb_s, ev_s = sheaf_embed(L, deg, n, d, m_sheaf)
     pred_s = kmeans_labels(emb_s, n_clusters)
 
+    # Лувен по пучково-взвешенному графу (Эксперимент Б)
+    pred_l = louvain_sheaf(G, frames, tickers, d)
+    res_l = eval_partition(pred_l, emb_s, y_sec, y_cty, G, tickers)
+
     # граф
     A = adjacency(G, tickers)
     emb_g, ev_g = graph_embed(A, n_clusters)
@@ -183,8 +271,9 @@ def run_both(feat: pd.DataFrame, R_win: pd.DataFrame, tickers, meta,
     res_s = eval_partition(pred_s, emb_s, y_sec, y_cty, G, tickers)
     res_g = eval_partition(pred_g, emb_g, y_sec, y_cty, G, tickers)
     return dict(G=G, L=L, deg=deg, emb_s=emb_s, emb_g=emb_g,
-                pred_s=pred_s, pred_g=pred_g, res_s=res_s, res_g=res_g,
-                ev_s=ev_s)
+                pred_s=pred_s, pred_g=pred_g, pred_l=pred_l,
+                res_s=res_s, res_g=res_g, res_l=res_l,
+                ev_s=ev_s, k_eff=k_eff)
 
 
 
@@ -218,6 +307,58 @@ def _fmt(res: dict) -> str:
 HDR = f"{'метод':22}{'ARI_sec':>10}{'NMI_sec':>10}{'ARI_cty':>11}{'silhouette':>11}{'modular':>12}"
 
 
+#  dim ker connection Laplacian на скользящем окне 
+def rolling_kernel_indicator(R, tickers, meta, d, k_graph, corr, adaptive,
+                             win=63, step=21, eps=0.1, tau=0.3):
+    idx = R.index
+    n = len(tickers)
+    rows = []
+    for s in range(0, len(idx) - win + 1, step):
+        Rw = R.iloc[s:s + win]
+        sim = market_corr(Rw, corr)
+        vol = float(Rw.mean(axis=1).std() * np.sqrt(252))
+        k_eff = adaptive_k(k_graph, len(Rw), vol, n) if adaptive else k_graph
+        G = build_graph_knn(sim.loc[tickers, tickers], meta, k=k_eff,
+                            signed=True, mutual=False)
+        beta0 = nx.number_connected_components(G)
+        frames = tangent_frames(stalk_returns(Rw, tickers), G, tickers, d)
+        L, deg = connection_laplacian(G, tickers, frames, d)
+        dvec = np.repeat(deg, d)
+        dinv = 1.0 / np.sqrt(np.clip(dvec, 1e-12, None))
+        Lsym = (L * dinv[None, :]) * dinv[:, None]
+        Lsym = 0.5 * (Lsym + Lsym.T)
+        ev = np.clip(np.linalg.eigvalsh(Lsym), 0, None)
+        nz = ev[ev >= TOL]
+        rows.append(dict(
+            date=idx[s + win - 1], vol=round(vol, 4), beta0=beta0, k_eff=k_eff,
+            dim_ker=int((ev < TOL).sum()),
+            soft_ker=int((ev < eps).sum()),
+            heat_dim=float(np.sum(np.exp(-ev / tau))),
+            frustration=d * beta0 - int((ev < TOL).sum()),
+            lam2=float(nz.min()) if len(nz) else 0.0,
+        ))
+    return pd.DataFrame(rows)
+
+
+def load_vix(path: str, index: pd.DatetimeIndex) -> pd.Series | None:
+    try:
+        from preprocess import load_ticker
+        d = load_ticker(path)
+    except Exception:
+        return None
+    s = pd.Series(d["price"].values, index=pd.to_datetime(d["date"])).sort_index()
+    return s.reindex(index).ffill().bfill()
+
+
+def window_aggregate(series: pd.Series, index, win: int, step: int):
+    vmean, vend = [], []
+    for s in range(0, len(index) - win + 1, step):
+        w = series.iloc[s:s + win]
+        vmean.append(float(w.mean()))
+        vend.append(float(w.iloc[-1]))
+    return np.array(vmean), np.array(vend)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dim", type=int, default=2, help="размерность стебля d")
@@ -225,8 +366,22 @@ def main():
     ap.add_argument("--stalk", choices=["returns", "prices"], default="returns")
     ap.add_argument("--m-sheaf", type=int, default=0,
                     help="число младших собств. векторов пучка (0 = как #кластеров)")
+    ap.add_argument("--corr", choices=["pearson", "spearman", "robust"],
+                    default="pearson",
+                    help="мера корреляции для графа (Эксперимент А: spearman/robust "
+                         "устойчивее к кризисным выбросам)")
+    ap.add_argument("--no-adaptive-k", action="store_true",
+                    help="отключить адаптивный k (использовать фиксированный --k-graph)")
+    ap.add_argument("--w-vol", type=float, default=0.5,
+                    help="вес блока волатильности в обогащённом стебле (H3)")
+    ap.add_argument("--w-volume", type=float, default=0.5,
+                    help="вес блока объёма в обогащённом стебле (H3)")
+    ap.add_argument("--vix", type=str, default=None,
+                    help="путь к CSV VIX (Investing 'Прошлые данные - ...'); если задан, "
+                         "H5 сверяет индикатор с настоящим VIX вместо реализ. волатильности")
     args, _ = ap.parse_known_args()
     d = args.dim
+    adaptive = not args.no_adaptive_k
 
     R = pd.read_csv(os.path.join(PROC, "returns.csv"), index_col=0, parse_dates=True)
     P = pd.read_csv(os.path.join(PROC, "prices.csv"), index_col=0, parse_dates=True)
@@ -241,8 +396,10 @@ def main():
 
     print("=" * 78)
     print(f"КЛАСТЕРИЗАЦИЯ: пучковый лапласиан vs графовый  (Barbero et al. 2022)")
-    print(f"Активов={len(tickers)}, стебель d={d}, kNN k={args.k_graph}, "
-          f"#кластеров={k_clusters} (=числу секторов), стебель-тип={args.stalk}")
+    print(f"Активов={len(tickers)}, стебель d={d}, "
+          f"kNN k={args.k_graph}{' (адаптивный)' if adaptive else ' (фиксированный)'}, "
+          f"#кластеров={k_clusters} (=числу секторов), стебель-тип={args.stalk}, "
+          f"корреляция={args.corr}")
     print(f"Объёмы для H3: {'загружены' if volumes is not None else 'НЕТ'}")
     print("=" * 78)
 
@@ -264,28 +421,36 @@ def main():
         if len(Rw) < 30:
             print(f"  [{pname}] пропуск: мало наблюдений ({len(Rw)})")
             continue
-        sim = Rw.corr(method="pearson")
+        sim = market_corr(Rw, args.corr)
         feat = make_feat(Rw, P.loc[a:b], tickers, args.stalk)
         out = run_both(feat, Rw, tickers, meta, sim, d, args.k_graph,
-                       k_clusters, m_sheaf)
+                       k_clusters, m_sheaf, adaptive=adaptive)
         vol = float(Rw.mean(axis=1).std() * np.sqrt(252))
-        print(f"[{pname}]  n_дней={len(Rw)}, годовая волат. рынка={vol:.2f}")
+        print(f"[{pname}]  n_дней={len(Rw)}, годовая волат. рынка={vol:.2f}, "
+              f"k(эфф.)={out['k_eff']}")
         print("  " + HDR)
-        print(f"  {'пучок (sheaf)':22}" + _fmt(out["res_s"]))
+        print(f"  {'пучок (sheaf, kmeans)':22}" + _fmt(out["res_s"]))
+        print(f"  {'пучок (louvain)':22}" + _fmt(out["res_l"]))
         print(f"  {'граф (baseline)':22}" + _fmt(out["res_g"]))
         dari = out["res_s"]["ARI_sector"] - out["res_g"]["ARI_sector"]
-        dq = out["res_s"]["modularity"] - out["res_g"]["modularity"]
-        print(f"  Δ(пучок−граф): ARI_sec={dari:+.3f}, modularity={dq:+.3f}\n")
-        for meth, r in [("sheaf", out["res_s"]), ("graph", out["res_g"])]:
-            h1_rows.append(dict(period=pname, method=meth, vol=round(vol, 3), **r))
+        dq = out["res_l"]["modularity"] - out["res_g"]["modularity"]
+        print(f"  Δ: ARI_sec(пучок−граф)={dari:+.3f}, "
+              f"modularity(louvain−граф)={dq:+.3f}\n")
+        for meth, r in [("sheaf", out["res_s"]), ("louvain", out["res_l"]),
+                        ("graph", out["res_g"])]:
+            h1_rows.append(dict(period=pname, method=meth, vol=round(vol, 3),
+                                k_eff=out["k_eff"], **r))
     pd.DataFrame(h1_rows).to_csv(os.path.join(PROC, "cluster_H1.csv"),
                                  index=False, encoding="utf-8")
 
     # ---------------------------------------------------------------- H2 ----
     print("### Гипотеза 2: Фидлер пучка → ядро/периферия и системный риск\n")
-    sim_full = R.corr(method="pearson")
+    sim_full = market_corr(R, args.corr)
     feat_full = make_feat(R, P, tickers, args.stalk)
-    G = build_graph_knn(sim_full.loc[tickers, tickers], meta, k=args.k_graph,
+    vol_full = float(R.mean(axis=1).std() * np.sqrt(252))
+    k_full = adaptive_k(args.k_graph, len(R), vol_full, len(tickers)) if adaptive \
+        else args.k_graph
+    G = build_graph_knn(sim_full.loc[tickers, tickers], meta, k=k_full,
                         signed=True, mutual=False)
     frames = tangent_frames(feat_full, G, tickers, d)
     L, deg = connection_laplacian(G, tickers, frames, d)
@@ -327,31 +492,116 @@ def main():
 
     # ---------------------------------------------------------------- H3 ----
     print("\n### Гипотеза 3: обогащение стебля признаками (волат./объём)\n")
+    print(f"(веса блоков: доходности=1.0, волат.={args.w_vol}, объём={args.w_volume})")
     h3_variants = {
         "доходности": stalk_returns(R, tickers),
-        "+волатильность": stalk_augmented(R, tickers, volumes, use_vol=True, use_volume=False),
-        "+волат.+объём": stalk_augmented(R, tickers, volumes, use_vol=True, use_volume=True),
+        "+волатильность": stalk_augmented(R, tickers, volumes, use_vol=True,
+                                          use_volume=False, w_vol=args.w_vol),
+        "+волат.+объём": stalk_augmented(R, tickers, volumes, use_vol=True,
+                                         use_volume=True, w_vol=args.w_vol,
+                                         w_volume=args.w_volume),
     }
     print(HDR)
     h3_rows = []
     for name, feat in h3_variants.items():
         out = run_both(feat, R, tickers, meta, sim_full, d, args.k_graph,
-                       k_clusters, m_sheaf)
+                       k_clusters, m_sheaf, adaptive=adaptive)
         print(f"{name:22}" + _fmt(out["res_s"]))
         h3_rows.append(dict(features=name, **out["res_s"]))
-    # графовый baseline не зависит от признаков 
+    # графовый baseline не зависит от признаков
     base = run_both(stalk_returns(R, tickers), R, tickers, meta, sim_full,
-                    d, args.k_graph, k_clusters, m_sheaf)
+                    d, args.k_graph, k_clusters, m_sheaf, adaptive=adaptive)
     print(f"{'граф (baseline)':22}" + _fmt(base["res_g"]))
     h3_rows.append(dict(features="граф (baseline)", **base["res_g"]))
     pd.DataFrame(h3_rows).to_csv(os.path.join(PROC, "cluster_H3.csv"),
                                  index=False, encoding="utf-8")
 
-    
+    # ---------------------------------------------------------------- H4 ----
+    print("\n### Гипотеза 4 (Эксперимент В): матричные стебли на многообразии SPD\n")
+    y_sec = np.array([meta.loc[t, "sector"] for t in tickers])
+    y_cty = np.array([meta.loc[t, "country"] for t in tickers])
+    emb_spd = spd_logeuclid_embed(R, tickers, meta)
+    pred_spd = kmeans_labels(emb_spd, k_clusters)
+    res_spd = eval_partition(pred_spd, emb_spd, y_sec, y_cty, G, tickers)
+    ref = run_both(stalk_returns(R, tickers), R, tickers, meta, sim_full,
+                   d, args.k_graph, k_clusters, m_sheaf, adaptive=adaptive)
+    print(HDR)
+    print(f"{'SPD log-Euclid':22}" + _fmt(res_spd))
+    print(f"{'пучок (returns)':22}" + _fmt(ref["res_s"]))
+    print(f"{'пучок louvain':22}" + _fmt(ref["res_l"]))
+    print(f"{'граф baseline':22}" + _fmt(ref["res_g"]))
+    h4_rows = [dict(method="SPD log-Euclid", **res_spd),
+               dict(method="пучок (returns)", **ref["res_s"]),
+               dict(method="пучок louvain", **ref["res_l"]),
+               dict(method="граф baseline", **ref["res_g"])]
+    pd.DataFrame(h4_rows).to_csv(os.path.join(PROC, "cluster_H4_spd.csv"),
+                                 index=False, encoding="utf-8")
+    pd.DataFrame({"ticker": tickers, "country": y_cty, "sector": y_sec,
+                  "cluster_spd": pred_spd}).to_csv(
+        os.path.join(PROC, "cluster_H4_labels.csv"), index=False, encoding="utf-8")
+
+    # ---------------------------------------------------------------- H5 ----
+    print("\n### Гипотеза 5 (Эксперимент Г): dim ker L(t) как макро-индикатор стресса\n")
+    kern = rolling_kernel_indicator(R, tickers, meta, d, args.k_graph, args.corr,
+                                    adaptive, win=63, step=21)
+    # выбор меры стресса: настоящий VIX (если передан) либо реализ. волатильность
+    vix = load_vix(args.vix, R.index) if args.vix else None
+    if vix is not None:
+        vmean, vend = window_aggregate(vix, R.index, 63, 21)
+        kern["vix_mean"], kern["vix_end"] = vmean, vend
+        stress = kern["vix_mean"]
+        stress_name, stress_lbl = "VIX", "VIX (среднее по окну)"
+    else:
+        stress = kern["vol"]
+        stress_name, stress_lbl = "волат. рынка", "годовая волат. рынка (прокси VIX)"
+    kern.to_csv(os.path.join(PROC, "cluster_H5_kernel.csv"),
+                index=False, encoding="utf-8")
+
+    rs_heat, ps_heat = spearmanr(kern["heat_dim"], stress)
+    rs_l2, ps_l2 = spearmanr(kern["lam2"], stress)
+    print(f"Окон={len(kern)} (win=63, step=21). Спирмен с {stress_name}"
+          f"{' (' + os.path.basename(args.vix) + ')' if vix is not None else ''}:")
+    print(f"  heat_dim (Σe^-λ/τ, эфф. ker) ↔ {stress_name:12} : rs={rs_heat:+.3f} "
+          f"(p={ps_heat:.3f})   ожидаем < 0 (спокойно ⇒ выше эфф. dim ker)")
+    print(f"  λ₂ (алг. связность)         ↔ {stress_name:12} : rs={rs_l2:+.3f} "
+          f"(p={ps_l2:.3f})")
+    if vix is not None:
+        rs_vp, _ = spearmanr(kern["vol"], kern["vix_mean"])
+        print(f"  валидация прокси: реализ. волат. ↔ VIX : rs={rs_vp:+.3f} "
+              f"(наша волатильность как заменитель VIX)")
+    smax = kern.loc[stress.idxmax()]
+    smin = kern.loc[stress.idxmin()]
+    sfmt = (lambda r: f"VIX={r['vix_mean']:.1f}") if vix is not None \
+        else (lambda r: f"vol={r['vol']:.2f}")
+    print(f"  макс. стресс {smax['date'].date()} ({sfmt(smax)}): "
+          f"heat_dim={smax['heat_dim']:.2f}, λ₂={smax['lam2']:.3f}")
+    print(f"  мин. стресс  {smin['date'].date()} ({sfmt(smin)}): "
+          f"heat_dim={smin['heat_dim']:.2f}, λ₂={smin['lam2']:.3f}")
+
+    figk, axk = plt.subplots(figsize=(11, 5))
+    axk.plot(kern["date"], kern["heat_dim"], "o-", ms=3, color="#1f77b4",
+             label="эфф. dim ker (heat trace)")
+    axk.set_xlabel("дата (конец окна)")
+    axk.set_ylabel("эфф. dim ker  Σe^{-λ/τ}", color="#1f77b4")
+    axk.tick_params(axis="y", labelcolor="#1f77b4")
+    axk2 = axk.twinx()
+    axk2.plot(kern["date"], stress, "s--", ms=3, color="#d62728", alpha=0.7,
+              label=stress_lbl)
+    axk2.set_ylabel(stress_lbl, color="#d62728")
+    axk2.tick_params(axis="y", labelcolor="#d62728")
+    axk.set_title(f"H5: эфф. dim ker connection Laplacian vs {stress_lbl} "
+                  f"(rs={rs_heat:+.2f})")
+    figk.tight_layout()
+    figk.savefig(os.path.join(PROC, "cluster_kernel_indicator.png"), dpi=150,
+                 bbox_inches="tight")
+    plt.close(figk)
+
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
     hp = pd.DataFrame(h1_rows)
     piv = hp.pivot(index="period", columns="method", values="ARI_sector")
-    piv.plot(kind="bar", ax=axes[0], color={"sheaf": "#1f77b4", "graph": "#7f7f7f"})
+    cmap = {"sheaf": "#1f77b4", "louvain": "#2ca02c", "graph": "#7f7f7f"}
+    piv.plot(kind="bar", ax=axes[0],
+             color=[cmap.get(c, "#333333") for c in piv.columns])
     axes[0].set_title("H1: ARI(сектор) по периодам")
     axes[0].set_ylabel("ARI"); axes[0].tick_params(axis="x", rotation=20)
     axes[1].scatter(core_sheaf, sys_beta, c=["#d62728" if c == "RU" else "#1f77b4"
@@ -365,7 +615,8 @@ def main():
     plt.close(fig)
 
     print("\nСохранено: cluster_H1.csv, cluster_H2_core.csv, cluster_H3.csv, "
-          "cluster_summary.png")
+          "cluster_H4_spd.csv, cluster_H4_labels.csv, cluster_H5_kernel.csv, "
+          "cluster_summary.png, cluster_kernel_indicator.png")
 
 
 if __name__ == "__main__":
