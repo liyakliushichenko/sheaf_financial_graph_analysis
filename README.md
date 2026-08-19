@@ -12,4 +12,4 @@ Research project exploring sheaves and Connection Laplacian for financial time s
 | `build_sheaf.py` | скалярный весовой пучок, restriction = √\|ρ\|·sign, спектр L₀, H⁰/H¹ |
 | `connection_sheaf.py` | векторный пучок / Connection Laplacian: локальный PCA + Прокруст |
 | `node_classify.py` | классификация секторов (признаки, label spreading, пучок) |
-| `sheaf_cluster.py` | H1 (пучок/Louvain
+| `sheaf_cluster.py` | H1 (пучок/Louvain vs граф), H2 (Фидлер), H3 (признаки), H4 (SPD-стебли), H5 (теплоядро ↔ VIX) |
